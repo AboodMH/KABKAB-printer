@@ -7,35 +7,37 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# دالة لترتيب النصوص العربية بشكل صحيح (reshaper + bidi)
 def ar(text: str) -> str:
     if not text:
         return ""
-    reshaped = arabic_reshaper.reshape(text)  # ترتيب الحروف
-    bidi_text = get_display(reshaped)         # عكس الاتجاه RTL
+    reshaped = arabic_reshaper.reshape(text)
+    bidi_text = get_display(reshaped)
     return bidi_text
 
-# إعداد الطابعة (عدل الـ VendorID و ProductID حسب طابعتك)
+# إعداد الطابعة
 p = Usb(0x0fe6, 0x811e, interface=0, out_ep=0x02)
+
+try:
+    p._raw(b'\x1b\x40')  # ESC @ : reset الطابعة
+except:
+    pass
+
 
 @app.route('/print', methods=['POST'])
 def print_invoice():
     data = request.json
 
-    # بيانات من ال JSON
+    invoice_type = data.get('invoice_type', 'sell')
     cashier = data.get('cashier', 'غير معروف')
     invoice_number = data.get('invoice_no', '0000')
     date_time = data.get('date_time', datetime.now().strftime("%Y-%m-%d %H:%M"))
-    items = data.get('items', [])
-    payments = data.get('payments', [])
     note = data.get('note', '')
+    payments = data.get('payments', [])
 
-    # ثوابت ثابتة
     store_name = "KABKAB"
     phone = "0776078047"
     location = "عمان - المدينة الرياضية - مجمع السهلي"
 
-    # إعداد الخطوط
     header_font = ImageFont.truetype("Amiri-Bold.ttf", 90)
     regular_font = ImageFont.truetype("Amiri-Bold.ttf", 32)
     small_font = ImageFont.truetype("Amiri-Bold.ttf", 24)
@@ -45,14 +47,21 @@ def print_invoice():
     width = 576
     line_height = 50
     padding = 20
-    base_lines = 15
-    total_lines = base_lines + len(items) + 2
-    height = padding * 2 + total_lines * line_height
 
+    # حدد عدد الصفوف حسب نوع الفاتورة
+    if invoice_type == "sell":
+        total_rows = len(data.get('items', []))
+    elif invoice_type == "exchange":
+        total_rows = len(data.get('returned_products', [])) + len(data.get('new_products', []))
+    else:
+        total_rows = 0
+
+    base_lines = 15
+    total_lines = base_lines + total_rows + 6  # +6 لملخص الدفع والباقي
+    height = padding * 2 + total_lines * line_height
     img = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(img)
 
-    # دوال للرسم
     def draw_rtl(text, y, font=regular_font, align="right"):
         shaped = ar(text)
         bbox = draw.textbbox((0, 0), shaped, font=font)
@@ -77,7 +86,7 @@ def print_invoice():
             text_x = col_x + 5
         draw.text((text_x, text_y), shaped, font=font, fill="black")
 
-    # رسم رأس الفاتورة
+    # رأس الفاتورة
     y = padding - 20
     draw_rtl(store_name, y, font=header_font, align="center")
     y += 110
@@ -95,56 +104,71 @@ def print_invoice():
     y += line_height
     draw_rtl(f"رقم الفاتورة: {invoice_number}", y, font=small_font)
     y += line_height
-
     draw.line((padding, y, width - padding, y), fill="black", width=2)
     y += 10
 
-    # جدول المنتجات
-    headers = ["المنتج", "السعر", "الكمية", "الإجمالي"]
-    col_widths = [280, 80, 80, 100]
-    x_positions = []
-    x = width - padding
-    for w in col_widths:
-        x_positions.append(x - w)
-        x -= w
+    # دالة لرسم جدول المنتجات
+    def draw_table(products, title):
+        nonlocal y
+        if title != "المنتجات":
+            draw_rtl(title, y, font=small_font, align="center")
+            y += line_height
 
-    row_top = y
-    row_bottom = y + line_height
-    for i, head in enumerate(headers):
-        col_x = x_positions[i]
-        col_w = col_widths[i]
-        draw.rectangle([(col_x, row_top), (col_x + col_w, row_bottom)], outline="black", width=2)
-        draw_column_text(head, col_x, col_w, y, font=table_font, center=True)
-    y += line_height
+        headers = ["المنتج", "السعر", "الكمية", "الإجمالي"]
+        col_widths = [280, 80, 80, 100]
+        x_positions = []
+        x = width - padding
+        for w in col_widths:
+            x_positions.append(x - w)
+            x -= w
 
-    total_price = 0
-    total_qty = 0
-    for item in items:
-        product = item.get('product', '')
-        qty = int(item.get('qty', 0))
-        price = float(item.get('price', 0))
-        subtotal = qty * price
-        total_price += subtotal
-        total_qty += qty
-        values = [product, f"{price:.2f}", str(qty), f"{subtotal:.2f}"]
-        for i, val in enumerate(values):
+        # رأس الجدول
+        row_top = y
+        row_bottom = y + line_height
+        for i, head in enumerate(headers):
             col_x = x_positions[i]
             col_w = col_widths[i]
-            draw_column_text(val, col_x, col_w, y, font=table_font, center=True)
+            draw.rectangle([(col_x, row_top), (col_x + col_w, row_bottom)], outline="black", width=2)
+            draw_column_text(head, col_x, col_w, y, font=table_font, center=True)
         y += line_height
 
-    y += 10
-    # ملخص
-    summary_data = [(str(total_qty), "إجمالي الكمية"), (f"{total_price:.2f} دينار", "المجموع النهائي")]
+        total_price = 0
+        total_qty = 0
+        for item in products:
+            product = item.get('product', '')
+            qty = int(item.get('qty', 0))
+            price = float(item.get('price', 0))
+            subtotal = qty * price
+            total_price += subtotal
+            total_qty += qty
+            values = [product, f"{price:.2f}", str(qty), f"{subtotal:.2f}"]
+            for i, val in enumerate(values):
+                col_x = x_positions[i]
+                col_w = col_widths[i]
+                draw_column_text(val, col_x, col_w, y, font=table_font, center=True)
+            y += line_height
+        y += 10
+        return total_price, total_qty
+
+    # حسب نوع الفاتورة
+    if invoice_type == "sell":
+        total_price, total_qty = draw_table(data.get('items', []), "المنتجات")
+    elif invoice_type == "exchange":
+        returned_total, returned_qty = draw_table(data.get('returned_products', []), "المنتجات المرتجعة")
+        new_total, new_qty = draw_table(data.get('new_products', []), "المنتجات الجديدة")
+        total_price = new_total - returned_total  # الفرق النهائي
+        total_qty = new_qty - returned_qty
+
+    # ملخص الفاتورة (كمية ومجموع)
     total_table_width = width - 2 * padding
     cell_small_w = total_table_width // 4
     cell_large_w = total_table_width - cell_small_w
 
+    summary_data = [(str(total_qty), "إجمالي الكمية"), (f"{total_price:.2f} دينار", "المجموع النهائي")]
     for label, value in summary_data:
         x = padding
         draw.rectangle([(x, y), (x + cell_large_w, y + line_height)], outline="black", width=2)
         draw_column_text(label, x, cell_large_w, y, font=small_font, center=True)
-
         x = padding + cell_large_w
         draw.rectangle([(x, y), (x + cell_small_w, y + line_height)], outline="black", width=2)
         draw_column_text(value, x, cell_small_w, y, font=small_font, center=True)
@@ -167,7 +191,6 @@ def print_invoice():
         x = padding
         draw.rectangle([(x, y), (x + cell_large_w, y + line_height)], outline="black", width=2)
         draw_column_text(label, x, cell_large_w, y, font=small_font, center=True)
-
         x = padding + cell_large_w
         draw.rectangle([(x, y), (x + cell_small_w, y + line_height)], outline="black", width=2)
         draw_column_text(value, x, cell_small_w, y, font=small_font, center=True)
@@ -181,7 +204,6 @@ def print_invoice():
     x = padding
     draw.rectangle([(x, y), (x + cell_large_w, y + line_height)], outline="black", width=2)
     draw_column_text(f"{remaining:.2f} دينار", x, cell_large_w, y, font=small_font, center=True)
-
     x = padding + cell_large_w
     draw.rectangle([(x, y), (x + cell_small_w, y + line_height)], outline="black", width=2)
     draw_column_text("الباقي", x, cell_small_w, y, font=small_font, center=True)
@@ -201,7 +223,6 @@ def print_invoice():
     y += int(line_height * 0.6)
     draw_rtl("لا يُسمح بالاسترجاع، التبديل خلال 3 أيام.", y, font=small_font, align="center")
 
-    # تحويل الصورة للأبيض والأسود وإرسالها للطابعة
     bw = img.convert("L")
     p.image(bw)
     p.cut()
@@ -209,5 +230,4 @@ def print_invoice():
     return jsonify({"status": "success", "message": "تمت الطباعة بنجاح"})
 
 if __name__ == "__main__":
-    # شغل السيرفر على أي IP في الشبكة المحلية
     app.run(host='0.0.0.0', port=9000)
